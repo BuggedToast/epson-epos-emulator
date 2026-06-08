@@ -1,7 +1,7 @@
 # Epson ePOS Emulator
 
 A lightweight Epson ePOS print server emulator written in pure Python (stdlib only).  
-Designed to receive print jobs from **Symbioz** (or any ePOS-compatible POS system) and display them in a real-time **web dashboard**.
+Compatible with any POS system that uses the Epson ePOS-Print XML protocol (SOAP over HTTP).
 
 ---
 
@@ -38,7 +38,7 @@ sudo python epos_web.py
 python epos_web.py
 ```
 
-Open **http://localhost:8080** in your browser.
+Open **http://localhost:8080** in your browser (or whichever port you set via `DASHBOARD_PORT`).
 
 ### With Docker
 
@@ -58,7 +58,7 @@ Copy `.env.example` to `.env` and adjust:
 
 | Variable | Default | Description |
 |---|---|---|
-| `EPOS_PORT` | `80` | Port for the ePOS emulator (Symbioz points here) |
+| `EPOS_PORT` | `80` | Port for the ePOS emulator (your POS system points here) |
 | `DASHBOARD_PORT` | `8080` | Port for the web dashboard |
 | `TICKET_AUTO_SAVE` | `false` | Save every print job automatically |
 | `TICKET_SAVE_PATH` | *(empty)* | Folder where tickets are saved |
@@ -122,6 +122,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now epos
 sudo journalctl -u epos -f   # follow logs
 ```
+
+---
+
+## Compatibility
+
+Any POS software that speaks the **Epson ePOS-Print XML** protocol (SOAP/HTTP) should work out of the box.  
+The emulator accepts all requests and always responds with `success="true"`.
 
 ---
 

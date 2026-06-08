@@ -65,24 +65,58 @@ def save_ticket(tid: int, xml_body: str, lines: list):
     if TICKET_FORMAT == 'pdf':
         try:
             from fpdf import FPDF  # pip install fpdf2
-            pdf = FPDF()
-            pdf.set_margins(8, 10, 8)
+
+            PAGE_W  = 80   # mm (rouleau 80mm)
+            MARGIN  = 5    # mm gauche/droite
+            COLS    = 48   # colonnes ePOS
+            PAD_TOP = 6    # mm marge haute
+            PAD_BOT = 6    # mm marge basse
+            USABLE  = PAGE_W - 2 * MARGIN
+
+            # Courier : largeur d'un caractère = 0.6 × taille (points)
+            # 1 point = 0.3528 mm  → on calcule la taille max pour tenir COLS
+            FONT_PT = min(8.0, (USABLE / (COLS * 0.6 * 0.3528)))
+            FONT_PT = int(FONT_PT * 2) / 2   # arrondi au 0.5pt inférieur
+            LINE_H  = round(FONT_PT * 0.55, 2)  # hauteur ligne proportionnelle
+
+            def _to_latin1(s):
+                return s.encode('latin-1', errors='replace').decode('latin-1')
+
+            # ── calcul de la hauteur exacte du contenu ──────────────────────
+            content_h = 0.0
+            for ln in lines:
+                if ln.get('text', '') == '':
+                    content_h += LINE_H * 0.5
+                else:
+                    content_h += LINE_H
+            page_h = PAD_TOP + content_h + PAD_BOT
+
+            pdf = FPDF(orientation='P', unit='mm', format=(PAGE_W, page_h))
+            pdf.set_margins(MARGIN, PAD_TOP, MARGIN)
             pdf.set_auto_page_break(False)
             pdf.add_page()
-            pdf.set_font('Courier', size=9)
+
             for ln in lines:
                 text  = ln.get('text', '')
-                align = {'center': 'C', 'right': 'R'}.get(ln.get('align', 'left'), 'L')
-                style = 'B' if ln.get('bold') else ''
-                pdf.set_font('Courier', style=style, size=9)
-                if ln.get('cut'):
-                    pdf.cell(0, 4, '-' * 32, align='C', new_x='LMARGIN', new_y='NEXT')
-                elif text == '':
-                    pdf.ln(3)
+                bold  = ln.get('bold', False)
+                align = ln.get('align', 'left')
+                cut   = ln.get('cut', False)
+
+                fpdf_align = {'center': 'C', 'right': 'R'}.get(align, 'L')
+                pdf.set_font('Courier', style='B' if bold else '', size=FONT_PT)
+
+                if text == '':
+                    pdf.ln(LINE_H * 0.5)
+                elif cut:
+                    pdf.set_font('Courier', size=FONT_PT)
+                    pdf.cell(USABLE, LINE_H, '-' * 40, align='C',
+                             new_x='LMARGIN', new_y='NEXT')
                 else:
-                    pdf.cell(0, 4, text, align=align, new_x='LMARGIN', new_y='NEXT')
+                    pdf.cell(USABLE, LINE_H, _to_latin1(text), align=fpdf_align,
+                             new_x='LMARGIN', new_y='NEXT')
+
             pdf.output(str(base) + '.pdf')
-            log.debug(f'Ticket #{tid} → {base}.pdf')
+            log.debug('Ticket #%d → %s.pdf', tid, base)
         except ImportError:
             log.warning('fpdf2 non installé → fallback XML. Installer : pip install fpdf2')
             base.with_suffix('.xml').write_text(xml_body, encoding='utf-8')
@@ -97,6 +131,8 @@ state   = {
     'total_req':     0,
     'total_tickets': 0,
     'started':       datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
+    'epos_port':     EPOS_PORT,
+    'dashboard_port': DASHBOARD_PORT,
 }
 lock = threading.Lock()
 
@@ -124,6 +160,7 @@ def _segments_to_line(segments: list, align: str) -> dict:
         return {'text': segs[0]['text'], 'align': align, 'bold': segs[0]['bold']}
 
     # Multi-colonnes : construire une chaîne monospace positionnée
+    # L'alignement est forcé à left — la position est déjà encodée dans les espaces
     result   = ''
     cur_col  = 0
     any_bold = any(s['bold'] for s in segs)
@@ -135,7 +172,7 @@ def _segments_to_line(segments: list, align: str) -> dict:
         result  += seg['text']
         cur_col += len(seg['text'])
 
-    return {'text': result, 'align': align, 'bold': any_bold}
+    return {'text': result, 'align': 'left', 'bold': any_bold}
 
 
 def parse_ticket(xml_body: str) -> list:
@@ -604,6 +641,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .vbody { align-items: stretch; }
   .rwrap {
     width: 100%;
+    max-width: calc(48ch + 24px);   /* 48 cols Courier New + padding .rbody */
+    margin: 0 auto;
     filter: drop-shadow(0 4px 20px rgba(0,0,0,.7));
   }
   .rtop {
@@ -655,14 +694,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <span style="font-size:20px">🖨️</span>
   <h1>ePOS Emulator</h1>
   <div class="dot"></div>
-  <div class="hright">Démarré le <b id="started">–</b> &nbsp;|&nbsp; ePOS sur port <b>80</b></div>
+  <div class="hright">Démarré le <b id="started">–</b> &nbsp;|&nbsp; ePOS port <b id="epos-port">–</b></div>
 </header>
 
 <div class="sbar">
   <div class="sc"><div class="lbl">Requêtes</div><div class="val" style="color:var(--blue)" id="s-req">0</div></div>
   <div class="sc"><div class="lbl">Tickets</div><div class="val" style="color:var(--green)" id="s-tkt">0</div></div>
-  <div class="sc"><div class="lbl">Dashboard</div><div class="val" style="color:var(--orange)">:8080</div></div>
-  <div class="sc"><div class="lbl">ePOS</div><div class="val" style="color:var(--blue)">:80</div></div>
+  <div class="sc"><div class="lbl">Dashboard</div><div class="val" style="color:var(--orange)" id="s-dport">–</div></div>
+  <div class="sc"><div class="lbl">ePOS</div><div class="val" style="color:var(--blue)" id="s-eport">–</div></div>
 </div>
 
 <div class="main">
@@ -728,27 +767,51 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     const t = tMap[id];
     if (!t) return;
     const lines = t.lines.map(ln => {
-      let style = 'display:block;white-space:pre-wrap;word-break:break-word;min-height:1.6em;font-family:"Courier New",monospace;font-size:13px;';
+      // white-space:pre pour préserver l'espacement des colonnes monospace
+      let style = 'display:block;white-space:pre;font-family:"Courier New",Courier,monospace;font-size:12px;line-height:1.55;min-height:1.55em;';
       if (ln.align === 'center') style += 'text-align:center;';
       else if (ln.align === 'right') style += 'text-align:right;';
       if (ln.bold) style += 'font-weight:700;';
       if (ln.cut)  style += 'color:#999;text-align:center;';
       return `<span style="${style}">${ln.text === '' ? '\u00a0' : esc(ln.text)}</span>`;
     }).join('');
-    const w = window.open('','_blank','width=400,height=600');
+    const w = window.open('','_blank','width=460,height=700');
     w.document.write(`<!DOCTYPE html><html><head><title>Ticket #${id}</title>
     <style>
-      body{margin:0;background:#fff;color:#111;font-family:'Courier New',monospace;}
-      .wrap{max-width:340px;margin:0 auto;padding:12px 16px;}
-      .meta{font-family:'Segoe UI',sans-serif;font-size:11px;color:#888;margin-bottom:8px;display:flex;justify-content:space-between;}
-      .meta b{color:#111;}
-      @media print{.noprint{display:none}}
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      html, body { background: #e8e8e8; }
+      body {
+        display: flex;
+        justify-content: center;
+        padding: 20px 0;
+        font-family: 'Courier New', Courier, monospace;
+      }
+      .wrap {
+        background: #fff;
+        width: 340px;
+        padding: 14px 18px 18px;
+        box-shadow: 0 2px 12px rgba(0,0,0,.25);
+      }
+      .meta {
+        font-family: 'Segoe UI', sans-serif;
+        font-size: 11px;
+        color: #888;
+        margin-bottom: 10px;
+        display: flex;
+        justify-content: space-between;
+      }
+      .meta b { color: #111; }
+      @media print {
+        html, body { background: #fff; padding: 0; }
+        .wrap { box-shadow: none; width: 100%; }
+        .noprint { display: none; }
+      }
     </style></head><body>
     <div class="wrap">
       <div class="meta noprint"><b>${esc(t.ip)}</b><span>${esc(t.ts)}</span></div>
       ${lines}
     </div>
-    <script>window.onload=()=>{window.print();}<\/script>
+    <script>window.onload=()=>{ window.print(); }<\/script>
     </body></html>`);
     w.document.close();
   }
@@ -822,9 +885,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         fetch('/api/events').then(r => r.json()),
         fetch('/api/tickets').then(r => r.json()),
       ]);
-      document.getElementById('s-req').textContent   = stats.total_req;
-      document.getElementById('s-tkt').textContent   = stats.total_tickets;
-      document.getElementById('started').textContent = stats.started;
+      document.getElementById('s-req').textContent    = stats.total_req;
+      document.getElementById('s-tkt').textContent    = stats.total_tickets;
+      document.getElementById('started').textContent  = stats.started;
+      document.getElementById('s-dport').textContent  = ':' + stats.dashboard_port;
+      document.getElementById('s-eport').textContent  = ':' + stats.epos_port;
+      document.getElementById('epos-port').textContent = stats.epos_port;
       const nm = {};
       tickets.forEach(t => { nm[t.id] = t; });
       tMap = nm;
