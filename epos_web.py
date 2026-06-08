@@ -10,7 +10,7 @@ import sys
 import threading
 import xml.etree.ElementTree as ET
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -36,6 +36,9 @@ DASHBOARD_PORT   = int(os.environ.get('DASHBOARD_PORT',  '8080'))
 TICKET_SAVE_PATH = os.environ.get('TICKET_SAVE_PATH', '').strip()
 TICKET_AUTO_SAVE = os.environ.get('TICKET_AUTO_SAVE', 'false').lower() == 'true'
 TICKET_FORMAT    = os.environ.get('TICKET_FORMAT',    'xml').lower()   # 'xml' | 'pdf'
+LOG_RETENTION_DAYS = int(os.environ.get('LOG_RETENTION_DAYS', '-1'))  # -1=infini, 0=pas de persistance, N=jours
+_LOG_DIR  = Path(TICKET_SAVE_PATH) if TICKET_SAVE_PATH else Path(__file__).parent
+_LOG_FILE = _LOG_DIR / 'epos_journal.json'
 
 # ─── Logging / --debug ─────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description='Epson ePOS Emulator + Dashboard')
@@ -124,9 +127,59 @@ def save_ticket(tid: int, xml_body: str, lines: list):
         base.with_suffix('.xml').write_text(xml_body, encoding='utf-8')
         log.debug(f'Ticket #{tid} → {base}.xml')
 
+# ─── Journal persistant ───────────────────────────────────────────────────────
+def load_journal(ev_deque, tkt_deque, st):
+    """Charge les tickets depuis le fichier journal (respecte LOG_RETENTION_DAYS)."""
+    if LOG_RETENTION_DAYS == 0:
+        return
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    if not _LOG_FILE.exists():
+        return
+    try:
+        data    = json.loads(_LOG_FILE.read_text(encoding='utf-8'))
+        loaded  = data.get('tickets', [])
+        if LOG_RETENTION_DAYS > 0:
+            cutoff = datetime.now() - timedelta(days=LOG_RETENTION_DAYS)
+            loaded = [t for t in loaded
+                      if datetime.strptime(t['ts'], '%Y-%m-%d %H:%M:%S') >= cutoff]
+        for t in loaded:
+            tkt_deque.append(t)
+            ev_deque.append({
+                'ts':       t['ts'][11:19],
+                'dt':       t['ts'],
+                'method':   'POST',
+                'path':     t.get('path', '/'),
+                'ip':       t['ip'],
+                'ticket_id': t['id'],
+            })
+        if loaded:
+            st['total_tickets'] = max(t['id'] for t in loaded)
+            st['total_req']     = st['total_tickets']
+        log.debug('Journal chargé : %d tickets', len(loaded))
+    except Exception as e:
+        log.warning('Impossible de charger le journal : %s', e)
+
+
+def save_journal(tkt_deque):
+    """Persiste les tickets dans le fichier journal."""
+    if LOG_RETENTION_DAYS == 0:
+        return
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _LOG_FILE.write_text(
+            json.dumps({'tickets': list(tkt_deque)}, ensure_ascii=False),
+            encoding='utf-8'
+        )
+    except Exception as e:
+        log.warning('Impossible de sauvegarder le journal : %s', e)
+
+
 # ─── État partagé ──────────────────────────────────────────────────────────────
-events  = deque(maxlen=200)
-tickets = deque(maxlen=50)
+events  = deque(maxlen=2000)
+tickets = deque()
 state   = {
     'total_req':     0,
     'total_tickets': 0,
@@ -300,6 +353,7 @@ class EpsonEPOSHandler(BaseHTTPRequestHandler):
         with lock:
             events.appendleft({
                 'ts':     datetime.now().strftime('%H:%M:%S'),
+                'dt':     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'method': 'GET',
                 'path':   self.path,
                 'ip':     ip,
@@ -317,8 +371,10 @@ class EpsonEPOSHandler(BaseHTTPRequestHandler):
         has_content = any(ln.get('text', '').strip() for ln in parsed)
         with lock:
             state['total_req'] += 1
+            now = datetime.now()
             event = {
-                'ts':     datetime.now().strftime('%H:%M:%S'),
+                'ts':     now.strftime('%H:%M:%S'),
+                'dt':     now.strftime('%Y-%m-%d %H:%M:%S'),
                 'method': 'POST',
                 'path':   self.path,
                 'ip':     ip,
@@ -338,6 +394,7 @@ class EpsonEPOSHandler(BaseHTTPRequestHandler):
             events.appendleft(event)
         if has_content:
             log.debug('[POST] Ticket #%d  ← %s  (%d lignes)', tid, ip, len(parsed))
+            save_journal(tickets)
             if TICKET_AUTO_SAVE and TICKET_SAVE_PATH:
                 save_ticket(tid, body, parsed)
         else:
@@ -392,11 +449,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _serve_events(self):
         with lock:
-            self._json_response(list(events)[:30])
+            self._json_response(list(events))
 
     def _serve_tickets(self):
         with lock:
-            self._json_response(list(tickets)[:10])
+            self._json_response(list(tickets))
 
     def _serve_stats(self):
         with lock:
@@ -510,6 +567,36 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-size: 11px;
     color: var(--text);
   }
+  /* filtres journal */
+  .phdr-filters {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 8px;
+  }
+  .fbtn {
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--muted);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background .15s, color .15s, border-color .15s;
+  }
+  .fbtn:hover { background: var(--blue); color:#fff; border-color: var(--blue); }
+  .fbtn.active { background: var(--blue); color:#fff; border-color: var(--blue); }
+  #filter-date {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--text);
+    cursor: pointer;
+  }
+  #filter-date:focus { outline: none; border-color: var(--blue); }
   .pbody { flex: 1; overflow-y: auto; }
   .pbody::-webkit-scrollbar { width: 5px; }
   .pbody::-webkit-scrollbar-track { background: transparent; }
@@ -708,7 +795,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   <!-- Journal -->
   <div class="jpanel" id="jpanel">
-    <div class="phdr">📡 Journal des connexions <span class="cnt" id="ev-cnt">0</span></div>
+    <div class="phdr">
+      📋 Journal
+      <div class="phdr-filters">
+        <button id="filter-tkt-btn" class="fbtn" onclick="toggleTicketFilter()" title="Afficher uniquement les impressions">Tickets</button>
+        <select id="filter-date" onchange="applyDateFilter()" title="Filtrer par date">
+          <option value="">Toutes dates</option>
+        </select>
+      </div>
+      <span class="cnt" id="ev-cnt">0</span>
+    </div>
     <div class="pbody" id="jbody">
       <div class="empty"><span class="eico">📡</span>En attente de connexions…</div>
     </div>
@@ -735,13 +831,26 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
-  let selId    = null;
-  let autoLast = true;
-  let tMap     = {};
-  let prevEv   = 0;
-  let lastEvs  = [];
+  let selId             = null;
+  let autoLast          = true;
+  let tMap              = {};
+  let prevEv            = 0;
+  let lastEvs           = [];
+  let filterTicketsOnly = false;
+  let filterDate        = '';
 
   const autoToggle = document.getElementById('auto-last');
+
+  function toggleTicketFilter() {
+    filterTicketsOnly = !filterTicketsOnly;
+    document.getElementById('filter-tkt-btn').classList.toggle('active', filterTicketsOnly);
+    renderJournal(lastEvs);
+  }
+
+  function applyDateFilter() {
+    filterDate = document.getElementById('filter-date').value;
+    renderJournal(lastEvs);
+  }
 
   autoToggle.addEventListener('change', () => {
     autoLast = autoToggle.checked;
@@ -824,8 +933,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById('ev-cnt').textContent = '0';
       return;
     }
+
+    // Appliquer les filtres
+    let filtered = events;
+    if (filterTicketsOnly) filtered = filtered.filter(e => !!e.ticket_id);
+    if (filterDate)        filtered = filtered.filter(e => e.dt && e.dt.startsWith(filterDate));
+
+    if (!filtered.length) {
+      body.innerHTML = '<div class="empty"><span class="eico">🔍</span>Aucun résultat pour ce filtre</div>';
+      document.getElementById('ev-cnt').textContent = '0';
+      return;
+    }
+
     const isNew = events.length > prevEv;
-    body.innerHTML = events.map((e, i) => {
+    body.innerHTML = filtered.map((e, i) => {
       const hasTkt = !!e.ticket_id;
       let cls = 'row' + (hasTkt ? ' tkt' : '') +
                 (hasTkt && e.ticket_id === selId ? ' sel' : '') +
@@ -846,7 +967,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>`;
     }).join('');
     prevEv = events.length;
-    document.getElementById('ev-cnt').textContent = events.length;
+    document.getElementById('ev-cnt').textContent = filtered.length;
   }
 
   function renderViewer() {
@@ -891,9 +1012,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       document.getElementById('s-dport').textContent  = ':' + stats.dashboard_port;
       document.getElementById('s-eport').textContent  = ':' + stats.epos_port;
       document.getElementById('epos-port').textContent = stats.epos_port;
+
       const nm = {};
       tickets.forEach(t => { nm[t.id] = t; });
       tMap = nm;
+
+      // Mettre à jour le dropdown des dates disponibles
+      const dates = [...new Set(
+        Object.values(tMap).map(t => t.ts.substring(0, 10))
+      )].sort().reverse();
+      const sel = document.getElementById('filter-date');
+      const cur = sel.value;
+      sel.innerHTML = '<option value="">Toutes dates</option>' +
+        dates.map(d => `<option value="${d}"${d===cur?' selected':''}>${d}</option>`).join('');
+      if (!dates.includes(filterDate)) filterDate = '';  // reset si date disparue
+
       if (autoLast && tickets.length > 0) selId = tickets[0].id;
       renderJournal(events);
       renderViewer();
@@ -944,10 +1077,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
+    load_journal(events, tickets, state)
+
     epos_server = HTTPServer(('0.0.0.0', EPOS_PORT), EpsonEPOSHandler)
     t = threading.Thread(target=epos_server.serve_forever, daemon=True)
     t.start()
 
+    _ret = {-1: 'infini', 0: 'désactivé'}.get(LOG_RETENTION_DAYS, f'{LOG_RETENTION_DAYS} jour(s)')
     print('=' * 60)
     print('  ePOS Emulator + Dashboard')
     print('=' * 60)
@@ -955,6 +1091,7 @@ if __name__ == '__main__':
     print(f'  [Dashboard] http://0.0.0.0:{DASHBOARD_PORT}')
     if TICKET_AUTO_SAVE and TICKET_SAVE_PATH:
         print(f'  [Save]      {TICKET_SAVE_PATH}  (format={TICKET_FORMAT})')
+    print(f'  [Journal]   {_LOG_FILE}  (rétention={_ret})')
     if args.debug:
         print('  [Mode]      DEBUG activé')
     print('=' * 60)
