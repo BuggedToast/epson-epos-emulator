@@ -101,48 +101,153 @@ state   = {
 lock = threading.Lock()
 
 # ─── Parsing ePOS XML ──────────────────────────────────────────────────────────
-def parse_ticket(xml_body):
-    """Extrait les lignes d'un ticket ePOS XML sous forme de liste de dicts."""
+# Largeur papier en colonnes monospace (80mm, font A 12 dots/char → 48 cols)
+_PAPER_COLS = 48
+_CHAR_DOTS  = 12   # largeur d'un caractère standard en dots
+
+def _dots_to_col(x: int) -> int:
+    return round(x / _CHAR_DOTS)
+
+def _segments_to_line(segments: list, align: str) -> dict:
+    """
+    Convertit une liste de segments {x, text, bold} en une ligne rendue.
+    Si un seul segment sans x explicite → rendu simple.
+    Si plusieurs → colonnes positionnées avec des espaces.
+    """
+    if not segments:
+        return {'text': '', 'align': align, 'bold': False}
+
+    # Tri par position x
+    segs = sorted(segments, key=lambda s: s['x'])
+
+    if len(segs) == 1:
+        return {'text': segs[0]['text'], 'align': align, 'bold': segs[0]['bold']}
+
+    # Multi-colonnes : construire une chaîne monospace positionnée
+    result   = ''
+    cur_col  = 0
+    any_bold = any(s['bold'] for s in segs)
+    for seg in segs:
+        col = _dots_to_col(seg['x'])
+        if col > cur_col:
+            result += ' ' * (col - cur_col)
+            cur_col = col
+        result  += seg['text']
+        cur_col += len(seg['text'])
+
+    return {'text': result, 'align': align, 'bold': any_bold}
+
+
+def parse_ticket(xml_body: str) -> list:
+    """
+    Parse un body ePOS XML (avec ou sans envelope SOAP) et retourne
+    une liste de lignes : [{text, align, bold, cut?}]
+    Retourne [] si rien à imprimer (polling vide).
+    """
     try:
         clean = xml_body.strip()
-        # Supprimer les déclarations de namespace
         clean = re.sub(r'\s+xmlns(?::\w+)?="[^"]+"', '', clean)
-        # Supprimer les préfixes de namespace sur les balises (s:Body → Body)
         clean = re.sub(r'(</?)([\w]+):([\w-]+)', r'\1\3', clean)
         root  = ET.fromstring(clean)
-        # Si SOAP, descendre jusqu'au nœud epos-print
+
+        # Descendre jusqu'à <epos-print>
         target = root
         for elem in root.iter():
             if elem.tag == 'epos-print':
                 target = elem
                 break
-        lines     = []
-        cur_bold  = False
-        cur_align = 'left'
-        for elem in target.iter():
+
+        # ── État de style (cumulatif) ──────────────────────────────────────
+        em    = False   # bold (emphase)
+        dw    = False   # double-width (→ bold visuel)
+        align = 'left'
+        cur_x = 0       # position horizontale courante en dots
+
+        # ── Accumulateur de la ligne physique en cours ─────────────────────
+        # Un segment = {x, text, bold}  (même ligne tant qu'il n'y a pas de \n)
+        cur_segs: list = []
+
+        lines: list = []
+
+        def flush(force_align=None):
+            """Vider le segment courant → une ligne."""
+            nonlocal cur_x
+            la = force_align or align
+            if cur_segs:
+                lines.append(_segments_to_line(cur_segs, la))
+                cur_segs.clear()
+            else:
+                lines.append({'text': '', 'align': la, 'bold': False})
+            cur_x = 0  # reset position horizontale après chaque ligne
+
+        # ── Itération sur les enfants directs de <epos-print> ─────────────
+        for elem in target:
             tag = elem.tag
+
             if tag == 'text':
-                # Mise à jour du style courant (éléments sans texte = setters)
+                # -- Mise à jour de l'état de style --------------------------
                 if 'em' in elem.attrib:
-                    cur_bold = elem.get('em').lower() == 'true'
+                    em = elem.get('em').lower() == 'true'
                 if 'dw' in elem.attrib:
-                    cur_bold = elem.get('dw').lower() == 'true'
+                    dw = elem.get('dw').lower() == 'true'
+                if 'width' in elem.attrib:
+                    try:
+                        dw = int(elem.get('width', '1')) >= 2
+                    except ValueError:
+                        pass
                 if 'align' in elem.attrib:
-                    cur_align = elem.get('align', cur_align)
-                raw = (elem.text or '').replace('\r', '').rstrip('\n')
-                if raw:
-                    for part in raw.split('\n'):
-                        lines.append({'text': part, 'align': cur_align, 'bold': cur_bold})
+                    align = elem.get('align', align)
+                if 'x' in elem.attrib:
+                    try:
+                        cur_x = int(elem.get('x', '0'))
+                    except ValueError:
+                        pass
+
+                raw = (elem.text or '').replace('\r', '')
+                if not raw:
+                    continue  # élément purement stylistique
+
+                bold = em or dw
+
+                # Découpe sur les sauts de ligne explicites (&#10;)
+                parts = raw.split('\n')
+                for i, part in enumerate(parts):
+                    if part:
+                        cur_segs.append({'x': cur_x, 'text': part, 'bold': bold})
+                        cur_x += len(part) * _CHAR_DOTS
+                    # Tout saut de ligne sauf le dernier (qui peut être vide)
+                    # déclenche un flush
+                    if i < len(parts) - 1:
+                        flush()
+
             elif tag == 'feed':
+                if cur_segs:
+                    flush()
                 n = int(elem.get('line', 1))
                 for _ in range(n):
                     lines.append({'text': '', 'align': 'left', 'bold': False})
+                cur_x = 0
+
             elif tag == 'cut':
-                lines.append({'text': '- - - - - - - - - - - - - -',
-                               'align': 'center', 'bold': False, 'cut': True})
-        return lines  # liste vide si rien à imprimer, pas de fallback XML
-    except Exception:
-        return [{'text': xml_body, 'align': 'left', 'bold': False}]
+                if cur_segs:
+                    flush()
+                lines.append({
+                    'text':  '─' * _PAPER_COLS,
+                    'align': 'center',
+                    'bold':  False,
+                    'cut':   True,
+                })
+                cur_x = 0
+
+        # Flush du dernier segment s'il reste quelque chose
+        if cur_segs:
+            flush()
+
+        return lines   # vide = rien à imprimer
+
+    except Exception as e:
+        log.debug('parse_ticket error: %s', e)
+        return []      # on ne pollue pas avec du XML brut
 
 
 # ─── ePOS Handler  (port 80) ───────────────────────────────────────────────────
