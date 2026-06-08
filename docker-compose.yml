@@ -1,0 +1,24 @@
+services:
+  epos:
+    build: .
+    container_name: epos_emulator
+    restart: unless-stopped          # redémarre automatiquement sauf arrêt manuel
+
+    # Variables d'environnement — valeurs par défaut surchargées par .env
+    env_file:
+      - .env
+
+    ports:
+      - "${EPOS_PORT:-80}:80"           # ePOS  (Symbioz/caisse)
+      - "${DASHBOARD_PORT:-8080}:8080"  # Dashboard web
+
+    volumes:
+      # Dossier de sauvegarde des tickets (hôte ↔ conteneur)
+      - tickets_data:/tickets
+
+    # Si TICKET_SAVE_PATH n'est pas défini dans .env, les tickets vont dans /tickets
+    environment:
+      - TICKET_SAVE_PATH=${TICKET_SAVE_PATH:-/tickets}
+
+volumes:
+  tickets_data:

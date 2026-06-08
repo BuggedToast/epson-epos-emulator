@@ -1,0 +1,4 @@
+# Core — aucune dépendance obligatoire (stdlib Python 3.8+)
+
+# Optionnel : génération PDF (TICKET_FORMAT=pdf)
+fpdf2>=2.7.0

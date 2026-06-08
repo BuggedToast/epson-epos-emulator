@@ -1,0 +1,21 @@
+# Environnement local (ne jamais committer le .env, seulement le .env.example)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Tickets sauvegardés
+tickets/
+/tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
